@@ -1,0 +1,11 @@
+# Build output
+main.js
+
+# Dependencies
+node_modules/
+
+# Per-vault user data
+data.json
+
+# Claude Code local settings
+.claude/settings.local.json

@@ -1,0 +1,10 @@
+{
+	"id": "project-control",
+	"name": "Project Control",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Simple project controls.",
+	"author": "Shawn Squire",
+	"authorUrl": "https://shawnsquire.me",
+	"isDesktopOnly": false
+}
