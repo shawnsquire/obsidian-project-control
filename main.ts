@@ -15,13 +15,14 @@ import {
     WorkspaceLeaf
 } from 'obsidian';
 
+import emojiData from './emoji-data.json';
+
 const DASHBOARD_VIEW_TYPE = 'project-dashboard';
 
 interface ProjectControlSettings {
     projectFolder: string;
     archiveFolder: string;
     prioritiesFile: string;
-    staleDays: number;
     collapsedSections: string[];
 }
 
@@ -29,7 +30,6 @@ const DEFAULT_SETTINGS: ProjectControlSettings = {
     projectFolder: '10 - Project',
     archiveFolder: '80 - Archive',
     prioritiesFile: '10 - Project/💫 Project Priorities.md',
-    staleDays: 30,
     collapsedSections: []
 };
 
@@ -100,18 +100,11 @@ export default class ProjectControlPlugin extends Plugin {
             callback: () => this.openProjectPageModal()
         });
 
-        // Go to project root
+        // Go to project page
         this.addCommand({
             id: 'go-to-project-root',
-            name: 'Go to Project Root',
+            name: 'Go to Project Page',
             callback: () => this.goToProjectRoot()
-        });
-
-        // Project actions
-        this.addCommand({
-            id: 'project-actions',
-            name: 'Project Actions',
-            callback: () => this.showProjectActions()
         });
 
         // Create project
@@ -121,39 +114,11 @@ export default class ProjectControlPlugin extends Plugin {
             callback: () => new CreateProjectModal(this.app, this).open()
         });
 
-        // Archive project
+        // Manage project
         this.addCommand({
-            id: 'archive-project',
-            name: 'Archive Project',
-            callback: () => this.showArchiveProjectModal()
-        });
-
-        // Find stale projects
-        this.addCommand({
-            id: 'find-stale-projects',
-            name: 'Find Stale Projects',
-            callback: () => this.findStaleProjects()
-        });
-
-        // Restore project from archive
-        this.addCommand({
-            id: 'restore-project',
-            name: 'Restore Project from Archive',
-            callback: () => this.showRestoreProjectModal()
-        });
-
-        // Rename project
-        this.addCommand({
-            id: 'rename-project',
-            name: 'Rename Project',
-            callback: () => this.showRenameProjectModal()
-        });
-
-        // Duplicate project
-        this.addCommand({
-            id: 'duplicate-project',
-            name: 'Duplicate Project',
-            callback: () => this.showDuplicateProjectModal()
+            id: 'manage-project',
+            name: 'Manage Project',
+            callback: () => this.showManageProjectModal()
         });
 
         // Open project priorities file
@@ -163,26 +128,32 @@ export default class ProjectControlPlugin extends Plugin {
             callback: () => this.openPrioritiesFile()
         });
 
-        // Edit project metadata
-        this.addCommand({
-            id: 'edit-project-metadata',
-            name: 'Edit Project Metadata',
-            callback: () => this.showEditMetadataModal()
-        });
-
-        // Sync all projects to priorities file
-        this.addCommand({
-            id: 'sync-all-to-priorities',
-            name: 'Sync All Projects to Priorities',
-            callback: () => this.syncAllProjectsToPriorities()
-        });
-
         // Open project dashboard
         this.addCommand({
             id: 'open-project-dashboard',
             name: 'Open Project Dashboard',
             callback: () => this.activateDashboardView()
         });
+
+        // Move note to project
+        this.addCommand({
+            id: 'move-note-to-project',
+            name: 'Move Note to Project',
+            callback: () => this.moveNoteToProject()
+        });
+
+        // File menu: Move to Project
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu, file) => {
+                if (file instanceof TFile) {
+                    menu.addItem((item) => {
+                        item.setTitle('Move to Project')
+                            .setIcon('folder-input')
+                            .onClick(() => this.moveNoteToProject(file));
+                    });
+                }
+            })
+        );
 
         this.addSettingTab(new ProjectControlSettingTab(this.app, this));
     }
@@ -228,13 +199,6 @@ export default class ProjectControlPlugin extends Plugin {
         if (!this.settings.prioritiesFile || this.settings.prioritiesFile.trim() === '') {
             this.settings.prioritiesFile = DEFAULT_SETTINGS.prioritiesFile;
             corrections.push(`Priorities file reset to "${DEFAULT_SETTINGS.prioritiesFile}"`);
-            needsSave = true;
-        }
-
-        // Validate staleDays
-        if (!this.settings.staleDays || this.settings.staleDays < 1) {
-            this.settings.staleDays = DEFAULT_SETTINGS.staleDays;
-            corrections.push(`Stale days reset to ${DEFAULT_SETTINGS.staleDays}`);
             needsSave = true;
         }
 
@@ -352,25 +316,6 @@ export default class ProjectControlPlugin extends Plugin {
         }).open();
     }
 
-    async showProjectActions(): Promise<void> {
-        const currentProject = this.getCurrentProject();
-        if (currentProject) {
-            new ProjectActionsModal(this.app, this, currentProject).open();
-            return;
-        }
-
-        // Not in a project, show picker first
-        const projects = this.getAllProjects();
-        if (projects.length === 0) {
-            new Notice('No projects found');
-            return;
-        }
-
-        new ProjectPickerModal(this.app, projects, 'Select project for actions', (project) => {
-            new ProjectActionsModal(this.app, this, project).open();
-        }).open();
-    }
-
     async openProjectPageModal() {
         const projects = this.getProjectsWithTag();
 
@@ -385,17 +330,6 @@ export default class ProjectControlPlugin extends Plugin {
         }));
 
         new OpenProjectModal(this.app, choices).open();
-    }
-
-    async showArchiveProjectModal() {
-        const projects = this.getAllProjects();
-
-        if (projects.length === 0) {
-            new Notice('No projects found');
-            return;
-        }
-
-        new ArchiveProjectModal(this.app, this, projects).open();
     }
 
     async archiveProject(project: ProjectInfo): Promise<void> {
@@ -690,103 +624,6 @@ export default class ProjectControlPlugin extends Plugin {
         await this.app.workspace.getLeaf().openFile(prioritiesFile);
     }
 
-    /**
-     * Sync all projects to priorities file based on their frontmatter status.
-     * This rebuilds the priorities file sections from frontmatter.
-     */
-    async syncAllProjectsToPriorities(): Promise<void> {
-        const projects = this.getAllProjects();
-        let synced = 0;
-        let skipped = 0;
-
-        for (const project of projects) {
-            if (!project.mainFile) {
-                skipped++;
-                continue;
-            }
-
-            const cache = this.app.metadataCache.getFileCache(project.mainFile);
-            const status = cache?.frontmatter?.status;
-
-            if (!status) {
-                // No status set, skip
-                skipped++;
-                continue;
-            }
-
-            await this.syncProjectStatusToPriorities(project, status);
-            synced++;
-        }
-
-        new Notice(`Synced ${synced} projects to priorities (${skipped} skipped - no status)`);
-    }
-
-    async findStaleProjects(): Promise<void> {
-        const projects = this.getAllProjects();
-        const now = Date.now();
-        const staleThreshold = this.settings.staleDays * 24 * 60 * 60 * 1000;
-
-        // Statuses that are intentionally paused - don't flag as stale
-        const exemptStatuses = ['coming-soon', 'deferred', 'on-hold'];
-
-        const staleProjects: { project: ProjectInfo; lastModified: number; reason: string }[] = [];
-
-        for (const project of projects) {
-            if (project.mainFile) {
-                const cache = this.app.metadataCache.getFileCache(project.mainFile);
-                const status = cache?.frontmatter?.status;
-
-                // Check if status is complete - flag as needing archival
-                if (status === 'complete') {
-                    staleProjects.push({
-                        project,
-                        lastModified: project.mainFile.stat.mtime,
-                        reason: 'Status: complete'
-                    });
-                    continue;
-                }
-
-                // Skip projects with exempt statuses (intentionally paused)
-                if (status && exemptStatuses.includes(status)) {
-                    continue;
-                }
-            }
-
-            // Only check inactivity for active projects (status: active or undefined)
-            const lastModified = await this.getProjectLastModified(project);
-            if (now - lastModified > staleThreshold) {
-                const daysAgo = Math.floor((now - lastModified) / (24 * 60 * 60 * 1000));
-                staleProjects.push({
-                    project,
-                    lastModified,
-                    reason: `No activity for ${daysAgo} days`
-                });
-            }
-        }
-
-        if (staleProjects.length === 0) {
-            new Notice('No stale projects found');
-            return;
-        }
-
-        new StaleProjectsModal(this.app, this, staleProjects).open();
-    }
-
-    async getProjectLastModified(project: ProjectInfo): Promise<number> {
-        let lastModified = 0;
-        const files = this.app.vault.getMarkdownFiles().filter(f =>
-            f.path.startsWith(project.path + '/')
-        );
-
-        for (const file of files) {
-            if (file.stat.mtime > lastModified) {
-                lastModified = file.stat.mtime;
-            }
-        }
-
-        return lastModified;
-    }
-
     async createProject(name: string, emoji?: string): Promise<void> {
         try {
             const projectPath = `${this.settings.projectFolder}/${name}`;
@@ -898,17 +735,6 @@ priority:
             console.error('Failed to restore project:', error);
             new Notice(`Failed to restore project: ${error.message}`);
         }
-    }
-
-    async showRestoreProjectModal(): Promise<void> {
-        const archivedProjects = this.getArchivedProjects();
-
-        if (archivedProjects.length === 0) {
-            new Notice('No archived projects found');
-            return;
-        }
-
-        new RestoreProjectModal(this.app, this, archivedProjects).open();
     }
 
     async renameProject(project: ProjectInfo, newName: string, newEmoji?: string, updateLinks: boolean = true): Promise<void> {
@@ -1027,25 +853,6 @@ priority:
         });
     }
 
-    async showRenameProjectModal(): Promise<void> {
-        const currentProject = this.getCurrentProject();
-        if (currentProject) {
-            new RenameProjectModal(this.app, this, currentProject).open();
-            return;
-        }
-
-        // Not in a project, show picker first
-        const projects = this.getAllProjects();
-        if (projects.length === 0) {
-            new Notice('No projects found');
-            return;
-        }
-
-        new ProjectPickerModal(this.app, projects, 'Select project to rename', (project) => {
-            new RenameProjectModal(this.app, this, project).open();
-        }).open();
-    }
-
     async duplicateProject(project: ProjectInfo, newName: string, newEmoji?: string, clearTasks: boolean = false): Promise<void> {
         try {
             const newPath = `${this.settings.projectFolder}/${newName}`;
@@ -1134,44 +941,6 @@ priority:
                 await this.copyFolderContents(child, newSubfolderPath, oldName, newName, clearTasks);
             }
         }
-    }
-
-    async showDuplicateProjectModal(): Promise<void> {
-        const currentProject = this.getCurrentProject();
-        if (currentProject) {
-            new DuplicateProjectModal(this.app, this, currentProject).open();
-            return;
-        }
-
-        // Not in a project, show picker first
-        const projects = this.getAllProjects();
-        if (projects.length === 0) {
-            new Notice('No projects found');
-            return;
-        }
-
-        new ProjectPickerModal(this.app, projects, 'Select project to duplicate', (project) => {
-            new DuplicateProjectModal(this.app, this, project).open();
-        }).open();
-    }
-
-    async showEditMetadataModal(): Promise<void> {
-        const currentProject = this.getCurrentProject();
-        if (currentProject) {
-            new EditProjectMetadataModal(this.app, this, currentProject).open();
-            return;
-        }
-
-        // Not in a project, show picker first
-        const projects = this.getAllProjects();
-        if (projects.length === 0) {
-            new Notice('No projects found');
-            return;
-        }
-
-        new ProjectPickerModal(this.app, projects, 'Select project to edit', (project) => {
-            new EditProjectMetadataModal(this.app, this, project).open();
-        }).open();
     }
 
     async parsePrioritiesFile(): Promise<DashboardData | null> {
@@ -1319,6 +1088,69 @@ priority:
             ? `[[${entry.projectName}|${entry.alias}]]`
             : `[[${entry.projectName}]]`;
         return `- ${emojiPart}${linkPart}`;
+    }
+
+    isProjectArchived(project: ProjectInfo): boolean {
+        const archivePath = normalizePath(this.settings.archiveFolder);
+        return project.path.startsWith(archivePath + '/') || project.path === archivePath;
+    }
+
+    async showManageProjectModal(): Promise<void> {
+        const currentProject = this.getCurrentProject();
+        if (currentProject) {
+            new ManageProjectModal(this.app, this, currentProject).open();
+            return;
+        }
+
+        // Check if we're in an archived project
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile) {
+            const archivePath = normalizePath(this.settings.archiveFolder);
+            const projectName = getProjectNameFromPath(activeFile.path, archivePath);
+            if (projectName) {
+                const projectPath = `${archivePath}/${projectName}`;
+                const projectFolder = this.app.vault.getAbstractFileByPath(projectPath);
+                if (projectFolder instanceof TFolder) {
+                    const mainFilePath = `${projectPath}/${projectName}.md`;
+                    const mainFile = this.app.vault.getAbstractFileByPath(mainFilePath);
+                    const project: ProjectInfo = {
+                        folder: projectFolder,
+                        mainFile: mainFile instanceof TFile ? mainFile : null,
+                        name: projectName,
+                        path: projectPath
+                    };
+                    new ManageProjectModal(this.app, this, project).open();
+                    return;
+                }
+            }
+        }
+
+        // Not in a project, show picker
+        const projects = [...this.getAllProjects(), ...this.getArchivedProjects()];
+        if (projects.length === 0) {
+            new Notice('No projects found');
+            return;
+        }
+
+        new ProjectPickerModal(this.app, projects, 'Select project to manage', (project) => {
+            new ManageProjectModal(this.app, this, project).open();
+        }).open();
+    }
+
+    async moveNoteToProject(file?: TFile): Promise<void> {
+        const targetFile = file || this.app.workspace.getActiveFile();
+        if (!targetFile) {
+            new Notice('No active file');
+            return;
+        }
+
+        const projects = this.getProjectsWithTag();
+        if (projects.length === 0) {
+            new Notice('No projects found');
+            return;
+        }
+
+        new MoveNoteToProjectModal(this.app, this, projects, targetFile).open();
     }
 }
 
@@ -1953,9 +1785,9 @@ class ProjectDashboardView extends ItemView {
 
         if (entry.project) {
             menu.addItem(item => {
-                item.setTitle('Edit Metadata');
+                item.setTitle('Manage Project');
                 item.onClick(() => {
-                    const modal = new EditProjectMetadataModal(this.app, this.plugin, entry.project!);
+                    const modal = new ManageProjectModal(this.app, this.plugin, entry.project!);
                     const origOnClose = modal.onClose.bind(modal);
                     modal.onClose = () => {
                         origOnClose();
@@ -2086,163 +1918,9 @@ class ProjectPickerModal extends FuzzySuggestModal<ProjectInfo> {
     }
 }
 
-class ArchiveProjectModal extends FuzzySuggestModal<ProjectInfo> {
-    plugin: ProjectControlPlugin;
-    projects: ProjectInfo[];
-
-    constructor(app: App, plugin: ProjectControlPlugin, projects: ProjectInfo[]) {
-        super(app);
-        this.plugin = plugin;
-        this.projects = projects;
-        this.setPlaceholder('Select a project to archive');
-    }
-
-    getItems() {
-        return this.projects;
-    }
-
-    getItemText(item: ProjectInfo) {
-        return item.name;
-    }
-
-    async onChooseItem(item: ProjectInfo) {
-        await this.plugin.archiveProject(item);
-    }
-}
-
-class ProjectActionsModal extends Modal {
-    plugin: ProjectControlPlugin;
-    project: ProjectInfo;
-
-    constructor(app: App, plugin: ProjectControlPlugin, project: ProjectInfo) {
-        super(app);
-        this.plugin = plugin;
-        this.project = project;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
-
-        contentEl.createEl('h2', { text: `Project: ${this.project.name}` });
-
-        // Get current status for display
-        let currentStatus = 'active';
-        if (this.project.mainFile) {
-            const cache = this.app.metadataCache.getFileCache(this.project.mainFile);
-            currentStatus = cache?.frontmatter?.status || 'active';
-        }
-
-        new Setting(contentEl)
-            .setName('Open main file')
-            .setDesc('Navigate to the project root file')
-            .addButton(btn => btn
-                .setButtonText('Open')
-                .setCta()
-                .onClick(() => {
-                    if (this.project.mainFile) {
-                        this.app.workspace.getLeaf().openFile(this.project.mainFile);
-                    }
-                    this.close();
-                }));
-
-        new Setting(contentEl)
-            .setName('Change status')
-            .setDesc(`Current: ${currentStatus}`)
-            .addButton(btn => btn
-                .setButtonText('Change')
-                .setCta()
-                .onClick(() => {
-                    this.close();
-                    new QuickStatusModal(this.app, this.plugin, this.project).open();
-                }));
-
-        new Setting(contentEl)
-            .setName('Open in file explorer')
-            .setDesc('Reveal project folder in file explorer')
-            .addButton(btn => btn
-                .setButtonText('Reveal')
-                .onClick(() => {
-                    // @ts-ignore - internal API
-                    this.app.internalPlugins.plugins['file-explorer']?.instance?.revealInFolder(this.project.folder);
-                    this.close();
-                }));
-
-        new Setting(contentEl)
-            .setName('Add to priorities')
-            .setDesc('Add this project to the priorities file')
-            .addButton(btn => btn
-                .setButtonText('Add')
-                .onClick(async () => {
-                    const emoji = this.plugin.getProjectEmoji(this.project);
-                    await this.plugin.addToPriorities(this.project.name, 'Additional', emoji);
-                    new Notice('Added to priorities');
-                    this.close();
-                }));
-
-        new Setting(contentEl)
-            .setName('Remove from priorities')
-            .setDesc('Remove this project from the priorities file')
-            .addButton(btn => btn
-                .setButtonText('Remove')
-                .onClick(async () => {
-                    await this.plugin.removeFromPriorities(this.project.name);
-                    new Notice('Removed from priorities');
-                    this.close();
-                }));
-
-        new Setting(contentEl)
-            .setName('Edit metadata')
-            .setDesc('Edit project title, status, and priority')
-            .addButton(btn => btn
-                .setButtonText('Edit')
-                .onClick(() => {
-                    this.close();
-                    new EditProjectMetadataModal(this.app, this.plugin, this.project).open();
-                }));
-
-        new Setting(contentEl)
-            .setName('Rename project')
-            .setDesc('Rename this project and optionally update links')
-            .addButton(btn => btn
-                .setButtonText('Rename')
-                .onClick(() => {
-                    this.close();
-                    new RenameProjectModal(this.app, this.plugin, this.project).open();
-                }));
-
-        new Setting(contentEl)
-            .setName('Duplicate project')
-            .setDesc('Create a copy of this project')
-            .addButton(btn => btn
-                .setButtonText('Duplicate')
-                .onClick(() => {
-                    this.close();
-                    new DuplicateProjectModal(this.app, this.plugin, this.project).open();
-                }));
-
-        new Setting(contentEl)
-            .setName('Archive project')
-            .setDesc('Move this project to the archive folder')
-            .addButton(btn => btn
-                .setButtonText('Archive')
-                .setWarning()
-                .onClick(async () => {
-                    await this.plugin.archiveProject(this.project);
-                    this.close();
-                }));
-    }
-
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-    }
-}
-
 class CreateProjectModal extends Modal {
     plugin: ProjectControlPlugin;
     nameInput: TextComponent;
-    emojiInput: TextComponent;
 
     constructor(app: App, plugin: ProjectControlPlugin) {
         super(app);
@@ -2255,6 +1933,8 @@ class CreateProjectModal extends Modal {
 
         contentEl.createEl('h2', { text: 'Create New Project' });
 
+        let emojiValue = '';
+
         new Setting(contentEl)
             .setName('Project name')
             .setDesc('Enter the name of your new project')
@@ -2263,13 +1943,20 @@ class CreateProjectModal extends Modal {
                 text.setPlaceholder('My Project');
             });
 
-        new Setting(contentEl)
+        const emojiSetting = new Setting(contentEl)
             .setName('Emoji (optional)')
-            .setDesc('Add an emoji icon for the project')
-            .addText(text => {
-                this.emojiInput = text;
-                text.setPlaceholder('🎯');
-            });
+            .setDesc('Add an emoji icon for the project');
+
+        const emojiBtn = emojiSetting.controlEl.createEl('button', {
+            cls: 'mp-emoji-btn',
+            text: '+'
+        });
+        emojiBtn.addEventListener('click', () => {
+            new EmojiPickerModal(this.app, (emoji) => {
+                emojiValue = emoji;
+                emojiBtn.textContent = emoji;
+            }).open();
+        });
 
         new Setting(contentEl)
             .addButton(btn => btn
@@ -2277,14 +1964,13 @@ class CreateProjectModal extends Modal {
                 .setCta()
                 .onClick(async () => {
                     const name = this.nameInput.getValue().trim();
-                    const emoji = this.emojiInput.getValue().trim();
 
                     if (!name) {
                         new Notice('Please enter a project name');
                         return;
                     }
 
-                    await this.plugin.createProject(name, emoji || undefined);
+                    await this.plugin.createProject(name, emojiValue || undefined);
                     this.close();
                 }))
             .addButton(btn => btn
@@ -2295,84 +1981,6 @@ class CreateProjectModal extends Modal {
     onClose() {
         const { contentEl } = this;
         contentEl.empty();
-    }
-}
-
-class StaleProjectsModal extends Modal {
-    plugin: ProjectControlPlugin;
-    staleProjects: { project: ProjectInfo; lastModified: number; reason: string }[];
-
-    constructor(
-        app: App,
-        plugin: ProjectControlPlugin,
-        staleProjects: { project: ProjectInfo; lastModified: number; reason: string }[]
-    ) {
-        super(app);
-        this.plugin = plugin;
-        this.staleProjects = staleProjects;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
-
-        contentEl.createEl('h2', { text: 'Stale Projects' });
-        contentEl.createEl('p', { text: `Found ${this.staleProjects.length} projects that may need attention:` });
-
-        for (const { project, reason } of this.staleProjects) {
-            new Setting(contentEl)
-                .setName(project.name)
-                .setDesc(reason)
-                .addButton(btn => btn
-                    .setButtonText('Open')
-                    .onClick(() => {
-                        if (project.mainFile) {
-                            this.app.workspace.getLeaf().openFile(project.mainFile);
-                        }
-                        this.close();
-                    }))
-                .addButton(btn => btn
-                    .setButtonText('Archive')
-                    .setWarning()
-                    .onClick(async () => {
-                        await this.plugin.archiveProject(project);
-                        // Remove from list
-                        const idx = this.staleProjects.findIndex(p => p.project === project);
-                        if (idx > -1) {
-                            this.staleProjects.splice(idx, 1);
-                        }
-                        this.onOpen(); // Refresh
-                    }));
-        }
-    }
-
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-    }
-}
-
-class RestoreProjectModal extends FuzzySuggestModal<ProjectInfo> {
-    plugin: ProjectControlPlugin;
-    projects: ProjectInfo[];
-
-    constructor(app: App, plugin: ProjectControlPlugin, projects: ProjectInfo[]) {
-        super(app);
-        this.plugin = plugin;
-        this.projects = projects;
-        this.setPlaceholder('Select a project to restore');
-    }
-
-    getItems() {
-        return this.projects;
-    }
-
-    getItemText(item: ProjectInfo) {
-        return item.name;
-    }
-
-    async onChooseItem(item: ProjectInfo) {
-        await this.plugin.restoreProject(item);
     }
 }
 
@@ -2536,148 +2144,62 @@ class DuplicateProjectModal extends Modal {
     }
 }
 
-class EditProjectMetadataModal extends Modal {
-    plugin: ProjectControlPlugin;
-    project: ProjectInfo;
+class EmojiPickerModal extends Modal {
+    onSelect: (emoji: string) => void;
 
-    constructor(app: App, plugin: ProjectControlPlugin, project: ProjectInfo) {
+    constructor(app: App, onSelect: (emoji: string) => void) {
         super(app);
-        this.plugin = plugin;
-        this.project = project;
+        this.onSelect = onSelect;
     }
 
-    async onOpen() {
+    onOpen() {
         const { contentEl } = this;
         contentEl.empty();
+        contentEl.addClass('emoji-picker-modal');
 
-        contentEl.createEl('h2', { text: `Edit Metadata: ${this.project.name}` });
+        const searchInput = contentEl.createEl('input', {
+            type: 'text',
+            placeholder: 'Search emoji...',
+            cls: 'emoji-picker-search'
+        });
 
-        if (!this.project.mainFile) {
-            contentEl.createEl('p', { text: 'No main file found for this project.' });
-            return;
-        }
+        const grid = contentEl.createDiv({ cls: 'emoji-picker-grid' });
 
-        // Get current frontmatter
-        const cache = this.app.metadataCache.getFileCache(this.project.mainFile);
-        const frontmatter = cache?.frontmatter || {};
-
-        const currentTitle = frontmatter.title || this.project.name;
-        const currentStatus = frontmatter.status || 'active';
-        const currentPriority = frontmatter.priority || '';
-        const currentCategory = frontmatter.category || '';
-        const currentPriorityGroup = frontmatter['priority-group'] || '';
-        const currentEmoji = frontmatter.emoji || '';
-
-        let titleValue = currentTitle;
-        let statusValue = currentStatus;
-        let priorityValue = currentPriority;
-        let categoryValue = currentCategory;
-        let priorityGroupValue = currentPriorityGroup;
-        let emojiValue = currentEmoji;
-        const originalStatus = currentStatus;
-        const originalPriorityGroup = currentPriorityGroup;
-
-        new Setting(contentEl)
-            .setName('Title')
-            .setDesc('Project title')
-            .addText(text => text
-                .setValue(currentTitle)
-                .onChange(value => {
-                    titleValue = value;
-                }));
-
-        new Setting(contentEl)
-            .setName('Emoji')
-            .setDesc('Emoji icon for the project')
-            .addText(text => text
-                .setValue(currentEmoji)
-                .setPlaceholder('🎯')
-                .onChange(value => {
-                    emojiValue = value;
-                }));
-
-        new Setting(contentEl)
-            .setName('Status')
-            .setDesc('Project status (syncs to priorities file)')
-            .addDropdown(dropdown => dropdown
-                .addOption('active', 'Active')
-                .addOption('coming-soon', 'Coming Soon')
-                .addOption('deferred', 'Deferred')
-                .addOption('on-hold', 'On Hold')
-                .addOption('complete', 'Complete')
-                .setValue(currentStatus)
-                .onChange(value => {
-                    statusValue = value;
-                }));
-
-        new Setting(contentEl)
-            .setName('Category')
-            .setDesc('Project category (e.g., work/zeroedin, ttrpg/fey-fox)')
-            .addText(text => text
-                .setValue(currentCategory)
-                .setPlaceholder('category/subcategory')
-                .onChange(value => {
-                    categoryValue = value;
-                }));
-
-        new Setting(contentEl)
-            .setName('Priority Group')
-            .setDesc('Subsection in priorities (Foundation, Growth, Recharge)')
-            .addDropdown(dropdown => dropdown
-                .addOption('', '(none)')
-                .addOption('Foundation', 'Foundation')
-                .addOption('Growth', 'Growth')
-                .addOption('Recharge', 'Recharge')
-                .setValue(currentPriorityGroup)
-                .onChange(value => {
-                    priorityGroupValue = value;
-                }));
-
-        new Setting(contentEl)
-            .setName('Priority')
-            .setDesc('Project priority (e.g., high, medium, low)')
-            .addText(text => text
-                .setValue(currentPriority)
-                .setPlaceholder('high, medium, low')
-                .onChange(value => {
-                    priorityValue = value;
-                }));
-
-        new Setting(contentEl)
-            .addButton(btn => btn
-                .setButtonText('Save')
-                .setCta()
-                .onClick(async () => {
-                    if (this.project.mainFile) {
-                        await this.plugin.updateFrontmatter(this.project.mainFile, {
-                            title: titleValue,
-                            status: statusValue,
-                            emoji: emojiValue.trim() || null,
-                            category: categoryValue || null,
-                            priority: priorityValue || null,
-                            'priority-group': priorityGroupValue || null
-                        });
-
-                        // Sync status change to priorities file
-                        if (statusValue !== originalStatus) {
-                            await this.plugin.syncProjectStatusToPriorities(this.project, statusValue);
-                        }
-
-                        // Sync priority group change to priorities file
-                        if (priorityGroupValue !== originalPriorityGroup) {
-                            await this.plugin.moveProjectToSubsection(
-                                this.project.name,
-                                priorityGroupValue || null
-                            );
-                        }
-
-                        new Notice('Project metadata updated');
-                    }
+        const renderEmojis = (query: string) => {
+            grid.empty();
+            const q = query.toLowerCase().trim();
+            let filtered = emojiData as { emoji: string; keywords: string[] }[];
+            if (q) {
+                filtered = filtered.filter(e =>
+                    e.keywords.some(k => k.includes(q)) || e.emoji === q
+                );
+            }
+            const toShow = filtered.slice(0, 200);
+            for (const entry of toShow) {
+                const btn = grid.createEl('button', {
+                    cls: 'emoji-picker-btn',
+                    text: entry.emoji,
+                    attr: { title: entry.keywords.join(', ') }
+                });
+                btn.addEventListener('click', () => {
+                    this.onSelect(entry.emoji);
                     this.close();
-                }))
-            .addButton(btn => btn
-                .setButtonText('Cancel')
-                .onClick(() => this.close()));
+                });
+            }
+            if (toShow.length === 0) {
+                grid.createEl('div', {
+                    cls: 'emoji-picker-empty',
+                    text: 'No emoji found'
+                });
+            }
+        };
+
+        searchInput.addEventListener('input', () => {
+            renderEmojis(searchInput.value);
+        });
+
+        renderEmojis('');
+        searchInput.focus();
     }
 
     onClose() {
@@ -2686,7 +2208,7 @@ class EditProjectMetadataModal extends Modal {
     }
 }
 
-class QuickStatusModal extends Modal {
+class ManageProjectModal extends Modal {
     plugin: ProjectControlPlugin;
     project: ProjectInfo;
 
@@ -2699,54 +2221,247 @@ class QuickStatusModal extends Modal {
     async onOpen() {
         const { contentEl } = this;
         contentEl.empty();
+        contentEl.addClass('manage-project-modal');
 
-        contentEl.createEl('h2', { text: 'Change Project Status' });
-        contentEl.createEl('p', { text: this.project.name, cls: 'setting-item-description' });
+        const isArchived = this.plugin.isProjectArchived(this.project);
 
-        // Get current status
-        let currentStatus = 'active';
+        // Get current frontmatter
+        let frontmatter: Record<string, any> = {};
         if (this.project.mainFile) {
             const cache = this.app.metadataCache.getFileCache(this.project.mainFile);
-            currentStatus = cache?.frontmatter?.status || 'active';
+            frontmatter = cache?.frontmatter ? { ...cache.frontmatter } : {};
         }
 
-        contentEl.createEl('p', {
-            text: `Current status: ${currentStatus}`,
-            cls: 'setting-item-description'
+        let emojiValue = frontmatter.emoji || '';
+        let statusValue = frontmatter.status || 'active';
+        let categoryValue = frontmatter.category || '';
+        let priorityGroupValue = frontmatter['priority-group'] || '';
+        let priorityValue = frontmatter.priority || '';
+        const originalStatus = statusValue;
+        const originalPriorityGroup = priorityGroupValue;
+
+        // --- Identity section ---
+        const identityRow = contentEl.createDiv({ cls: 'mp-identity-row' });
+
+        const emojiBtn = identityRow.createEl('button', {
+            cls: 'mp-emoji-btn',
+            text: emojiValue || '+'
+        });
+        emojiBtn.addEventListener('click', () => {
+            new EmojiPickerModal(this.app, (emoji) => {
+                emojiValue = emoji;
+                emojiBtn.textContent = emoji;
+            }).open();
         });
 
-        const statusOptions: { value: string; label: string; desc: string }[] = [
-            { value: 'active', label: 'Active', desc: 'Actively working on this project' },
-            { value: 'coming-soon', label: 'Coming Soon', desc: 'Planned to start soon' },
-            { value: 'deferred', label: 'Deferred', desc: 'Postponed for later' },
-            { value: 'on-hold', label: 'On Hold', desc: 'Temporarily paused' },
-            { value: 'complete', label: 'Complete', desc: 'Finished (will be removed from priorities)' }
+        const titleGroup = identityRow.createDiv({ cls: 'mp-title-group' });
+        titleGroup.createSpan({ cls: 'mp-title-text', text: this.project.name });
+        const editBtn = titleGroup.createEl('button', {
+            cls: 'mp-title-edit-btn',
+            attr: { 'aria-label': 'Rename project' }
+        });
+        editBtn.textContent = '\u270E';
+        editBtn.addEventListener('click', () => {
+            this.close();
+            new RenameProjectModal(this.app, this.plugin, this.project).open();
+        });
+
+        // --- Status row ---
+        const statusRow = contentEl.createDiv({ cls: 'mp-status-row' });
+        statusRow.createSpan({ text: 'Status' });
+        const statusSelect = statusRow.createEl('select');
+        const statusOptions = [
+            { value: 'active', label: 'Active' },
+            { value: 'coming-soon', label: 'Coming Soon' },
+            { value: 'deferred', label: 'Deferred' },
+            { value: 'on-hold', label: 'On Hold' },
+            { value: 'complete', label: 'Complete' }
         ];
+        for (const opt of statusOptions) {
+            const optEl = statusSelect.createEl('option', { text: opt.label, value: opt.value });
+            if (opt.value === statusValue) optEl.selected = true;
+        }
+        statusSelect.addEventListener('change', () => {
+            statusValue = statusSelect.value;
+        });
 
-        for (const option of statusOptions) {
-            const setting = new Setting(contentEl)
-                .setName(option.label)
-                .setDesc(option.desc);
+        // --- Metadata fields ---
+        new Setting(contentEl)
+            .setName('Category')
+            .addText(text => text
+                .setValue(categoryValue)
+                .setPlaceholder('category/subcategory')
+                .onChange(value => { categoryValue = value; }));
 
-            if (option.value === currentStatus) {
-                setting.addButton(btn => btn
-                    .setButtonText('Current')
-                    .setDisabled(true));
-            } else {
-                setting.addButton(btn => btn
-                    .setButtonText('Set')
-                    .setCta()
+        new Setting(contentEl)
+            .setName('Priority Group')
+            .addDropdown(dropdown => dropdown
+                .addOption('', '(none)')
+                .addOption('Foundation', 'Foundation')
+                .addOption('Growth', 'Growth')
+                .addOption('Recharge', 'Recharge')
+                .setValue(priorityGroupValue)
+                .onChange(value => { priorityGroupValue = value; }));
+
+        new Setting(contentEl)
+            .setName('Priority')
+            .addText(text => text
+                .setValue(priorityValue)
+                .setPlaceholder('high, medium, low')
+                .onChange(value => { priorityValue = value; }));
+
+        // --- Action buttons ---
+        const actions = contentEl.createDiv({ cls: 'mp-actions' });
+
+        const openBtn = actions.createEl('button', { text: 'Open Project Page', cls: 'mod-cta' });
+        openBtn.addEventListener('click', () => {
+            if (this.project.mainFile) {
+                this.app.workspace.getLeaf().openFile(this.project.mainFile);
+            }
+            this.close();
+        });
+
+        const revealBtn = actions.createEl('button', { text: 'Reveal in Explorer' });
+        revealBtn.addEventListener('click', () => {
+            // @ts-ignore - internal API
+            this.app.internalPlugins.plugins['file-explorer']?.instance?.revealInFolder(this.project.folder);
+            this.close();
+        });
+
+        // --- Advanced section (collapsible) ---
+        const advancedHeader = contentEl.createDiv({ cls: 'mp-advanced-header' });
+        advancedHeader.createSpan({ cls: 'mp-advanced-icon', text: '\u25B6' });
+        advancedHeader.createSpan({ text: 'Advanced' });
+
+        const advancedContent = contentEl.createDiv({ cls: 'mp-advanced-content' });
+        advancedContent.style.display = 'none';
+
+        advancedHeader.addEventListener('click', () => {
+            const collapsed = advancedContent.style.display === 'none';
+            advancedContent.style.display = collapsed ? '' : 'none';
+            const icon = advancedHeader.querySelector('.mp-advanced-icon');
+            if (icon) icon.textContent = collapsed ? '\u25BC' : '\u25B6';
+        });
+
+        new Setting(advancedContent)
+            .setName('Duplicate')
+            .setDesc('Create a copy of this project')
+            .addButton(btn => btn
+                .setButtonText('Duplicate')
+                .onClick(() => {
+                    this.close();
+                    new DuplicateProjectModal(this.app, this.plugin, this.project).open();
+                }));
+
+        const archiveRestoreSetting = new Setting(advancedContent);
+        if (isArchived) {
+            archiveRestoreSetting
+                .setName('Restore')
+                .setDesc('Move this project back to the active folder')
+                .addButton(btn => btn
+                    .setButtonText('Restore')
                     .onClick(async () => {
-                        await this.plugin.changeProjectStatus(this.project, option.value);
+                        await this.plugin.restoreProject(this.project);
                         this.close();
                     }));
-            }
+        } else {
+            archiveRestoreSetting
+                .setName('Archive')
+                .setDesc('Move this project to the archive folder')
+                .addButton(btn => btn
+                    .setButtonText('Archive')
+                    .setWarning()
+                    .onClick(async () => {
+                        await this.plugin.archiveProject(this.project);
+                        this.close();
+                    }));
         }
+
+        // --- Footer ---
+        const footer = contentEl.createDiv({ cls: 'mp-footer' });
+
+        const saveBtn = footer.createEl('button', { text: 'Save', cls: 'mod-cta' });
+        saveBtn.addEventListener('click', async () => {
+            if (this.project.mainFile) {
+                await this.plugin.updateFrontmatter(this.project.mainFile, {
+                    status: statusValue,
+                    emoji: emojiValue.trim() || null,
+                    category: categoryValue || null,
+                    priority: priorityValue || null,
+                    'priority-group': priorityGroupValue || null
+                });
+
+                // Sync status change to priorities file
+                if (statusValue !== originalStatus) {
+                    await this.plugin.syncProjectStatusToPriorities(this.project, statusValue);
+                }
+
+                // Sync priority group change to priorities file
+                if (priorityGroupValue !== originalPriorityGroup) {
+                    await this.plugin.moveProjectToSubsection(
+                        this.project.name,
+                        priorityGroupValue || null
+                    );
+                }
+
+                new Notice('Project updated');
+            }
+            this.close();
+        });
+
+        const cancelBtn = footer.createEl('button', { text: 'Cancel' });
+        cancelBtn.addEventListener('click', () => this.close());
     }
 
     onClose() {
         const { contentEl } = this;
         contentEl.empty();
+    }
+}
+
+class MoveNoteToProjectModal extends FuzzySuggestModal<ProjectInfo> {
+    plugin: ProjectControlPlugin;
+    projects: ProjectInfo[];
+    file: TFile;
+
+    constructor(app: App, plugin: ProjectControlPlugin, projects: ProjectInfo[], file: TFile) {
+        super(app);
+        this.plugin = plugin;
+        this.projects = projects;
+        this.file = file;
+        this.setPlaceholder('Select project to move note to');
+    }
+
+    getItems() {
+        return this.projects;
+    }
+
+    getItemText(item: ProjectInfo) {
+        return item.name;
+    }
+
+    async onChooseItem(item: ProjectInfo) {
+        const destPath = `${item.path}/${this.file.name}`;
+
+        // Check for filename collision
+        const existing = this.app.vault.getAbstractFileByPath(destPath);
+        if (existing) {
+            new Notice(`A file named "${this.file.name}" already exists in ${item.name}`);
+            return;
+        }
+
+        // Move the file (auto-updates links)
+        await this.app.fileManager.renameFile(this.file, destPath);
+
+        // Add project frontmatter
+        const movedFile = this.app.vault.getAbstractFileByPath(destPath);
+        if (movedFile instanceof TFile) {
+            await this.plugin.updateFrontmatter(movedFile, {
+                project: `[[${item.name}]]`
+            });
+        }
+
+        new Notice(`Moved "${this.file.name}" to ${item.name}`);
     }
 }
 
@@ -2797,18 +2512,5 @@ class ProjectControlSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
-            .setName('Stale threshold (days)')
-            .setDesc('Projects with no activity for this many days are considered stale')
-            .addText(text => text
-                .setPlaceholder('30')
-                .setValue(String(this.plugin.settings.staleDays))
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    if (!isNaN(num) && num > 0) {
-                        this.plugin.settings.staleDays = num;
-                        await this.plugin.saveSettings();
-                    }
-                }));
     }
 }
